@@ -84,14 +84,17 @@ Tracker trackers[NUM_TRACKERS] = {
 int activeTracker = 0;
 
 struct DataPoint {
+  uint32_t recordId;
   uint32_t timestamp;
   int16_t value;
   char type[12];
 };
 
-const int MAX_RECORDS = 50;
-DataPoint dataLog[MAX_RECORDS];
+const int INITIAL_LOG_CAPACITY = 50;
+DataPoint* dataLog = nullptr;
+int logCapacity = 0;
 int logIndex = 0;
+uint32_t nextRecordId = 1;
 
 // --- STATE VARIABLES ---
 int menuSelection = 0;
@@ -111,6 +114,26 @@ unsigned long lastDisplayUpdate = 0;
 
 // Forward declarations
 void syncRtcFromNtp();
+bool ensureLogCapacity(int required);
+
+bool ensureLogCapacity(int required) {
+  if (required <= logCapacity) return true;
+
+  int newCapacity = (logCapacity > 0) ? logCapacity : INITIAL_LOG_CAPACITY;
+  while (newCapacity < required) {
+    newCapacity *= 2;
+  }
+
+  DataPoint* resized = (DataPoint*)realloc(dataLog, sizeof(DataPoint) * newCapacity);
+  if (!resized) {
+    Serial.println("Failed to grow log buffer");
+    return false;
+  }
+
+  dataLog = resized;
+  logCapacity = newCapacity;
+  return true;
+}
 
 // ==========================================
 //           INTERRUPT SERVICE ROUTINES
@@ -140,8 +163,9 @@ void formatLogLine(char* buf, size_t bufSize, const DataPoint& dp) {
            dt.Year(), dt.Month(), dt.Day(),
            dt.Hour(), dt.Minute(), dt.Second());
   snprintf(buf, bufSize,
-    "{\"schema\":1,\"event_id\":\"%s-%u\",\"timestamp\":\"%s\",\"device_id\":\"%s\",\"event_type\":\"%s\",\"value\":%d,\"unit\":\"mg\"}",
-    DEVICE_ID, dp.timestamp, timeStr, DEVICE_ID, dp.type, dp.value);
+    "{\"schema\":1,\"event_id\":\"%s-%u-%lu\",\"record_id\":%lu,\"timestamp\":\"%s\",\"device_id\":\"%s\",\"event_type\":\"%s\",\"value\":%d,\"unit\":\"mg\"}",
+    DEVICE_ID, dp.timestamp, (unsigned long)dp.recordId, (unsigned long)dp.recordId,
+    timeStr, DEVICE_ID, dp.type, dp.value);
 }
 
 void loadLogsFromFile() {
@@ -153,9 +177,14 @@ void loadLogsFromFile() {
   }
 
   logIndex = 0;
-  while (f.available() && logIndex < MAX_RECORDS) {
+  while (f.available()) {
     String line = f.readStringUntil('\n');
     if (line.length() < 10) continue;
+
+    if (!ensureLogCapacity(logIndex + 1)) {
+      Serial.println("Stopping log load due to memory pressure");
+      break;
+    }
 
     // Parse event_type
     int etIdx = line.indexOf("\"event_type\":\"");
@@ -185,9 +214,25 @@ void loadLogsFromFile() {
       continue;
     }
 
+    // Parse record_id (v2). If missing, assign stable incrementing id.
+    int recIdx = line.indexOf("\"record_id\":");
+    if (recIdx >= 0) {
+      recIdx += 12;
+      int recEnd = recIdx;
+      while (recEnd < (int)line.length() && isdigit(line[recEnd])) recEnd++;
+      dataLog[logIndex].recordId = strtoul(line.substring(recIdx, recEnd).c_str(), nullptr, 10);
+    } else {
+      dataLog[logIndex].recordId = nextRecordId;
+    }
+
     dataLog[logIndex].value = value;
     strncpy(dataLog[logIndex].type, eventType.c_str(), 11);
     dataLog[logIndex].type[11] = '\0';
+
+    if (dataLog[logIndex].recordId >= nextRecordId) {
+      nextRecordId = dataLog[logIndex].recordId + 1;
+    }
+
     logIndex++;
   }
 
@@ -277,7 +322,32 @@ void syncLogs() {
     while (f.available()) {
       String line = f.readStringUntil('\n');
       if (line.length() < 10) continue;
-      mqtt.publish(TOPIC_EVENTS, line.c_str());
+      bool published = false;
+      for (int attempt = 0; attempt < 3; attempt++) {
+        if (!mqtt.connected()) {
+          mqtt.connect(DEVICE_ID);
+        }
+
+        if (mqtt.connected() && mqtt.publish(TOPIC_EVENTS, line.c_str())) {
+          published = true;
+          break;
+        }
+
+        mqtt.loop();
+        delay(100);
+      }
+
+      if (!published) {
+        Serial.println("Sync failed: publish did not succeed");
+        drawSyncScreen("SYNC FAILED", "RETRY LATER");
+        f.close();
+        mqtt.disconnect();
+        WiFi.disconnect(true);
+        delay(1500);
+        currentState = menu;
+        return;
+      }
+
       sent++;
       char status[24];
       snprintf(status, sizeof(status), "SYNCING %d/%d", sent, totalLines);
@@ -308,10 +378,14 @@ void syncLogs() {
 }
 
 void saveData(int value, const char* type) {
-  if (logIndex >= MAX_RECORDS) return;
+  if (!ensureLogCapacity(logIndex + 1)) {
+    Serial.println("Skipping save: out of memory");
+    return;
+  }
 
   RtcDateTime now = rtc.GetDateTime();
 
+  dataLog[logIndex].recordId = nextRecordId++;
   dataLog[logIndex].timestamp = now.TotalSeconds();
   dataLog[logIndex].value = value;
   strncpy(dataLog[logIndex].type, type, 11);
@@ -865,6 +939,7 @@ void setup() {
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
   }
+  ensureLogCapacity(INITIAL_LOG_CAPACITY);
   loadLogsFromFile();
 
   // RTC compile-time fallback (no WiFi at boot)
