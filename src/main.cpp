@@ -42,6 +42,7 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 96
 #define DISPLAY_FPS 30
+#define MQTT_BUFFER_SIZE 512
 
 // ==========================================
 //               GLOBALS
@@ -274,6 +275,32 @@ void drawSyncScreen(const char* line1, const char* line2 = nullptr) {
   display.drawRGBBitmap(0, 0, canvas.getBuffer(), SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
+bool connectMqttForSync(char* clientId, size_t clientIdSize) {
+  snprintf(clientId, clientIdSize, "%s-sync-%lu", DEVICE_ID, (unsigned long)millis());
+  if (mqtt.connect(clientId)) {
+    return true;
+  }
+
+  Serial.print("MQTT connect failed. state=");
+  Serial.println(mqtt.state());
+  return false;
+}
+
+int estimatePacketSize(const String& payload, const char* topic) {
+  int topicLen = strlen(topic);
+  int payloadLen = payload.length();
+  int remainingLength = 2 + topicLen + payloadLen;
+
+  int remainingLenBytes = 1;
+  int x = remainingLength;
+  while (x > 127) {
+    remainingLenBytes++;
+    x /= 128;
+  }
+
+  return 1 + remainingLenBytes + 2 + topicLen + payloadLen;
+}
+
 void syncLogs() {
   currentState = syncing;
 
@@ -297,15 +324,16 @@ void syncLogs() {
 
   // 2. Connect MQTT
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  if (!mqtt.connect(DEVICE_ID)) {
-    Serial.println("MQTT connect failed");
+  char mqttClientId[64];
+  if (!connectMqttForSync(mqttClientId, sizeof(mqttClientId))) {
     drawSyncScreen("NO MQTT");
     delay(1500);
     WiFi.disconnect(true);
     currentState = menu;
     return;
   }
-  Serial.println("MQTT connected for sync");
+  Serial.print("MQTT connected for sync as ");
+  Serial.println(mqttClientId);
 
   // 3. Publish all logs
   File f = LittleFS.open("/logs.jsonl", "r");
@@ -325,12 +353,30 @@ void syncLogs() {
       bool published = false;
       for (int attempt = 0; attempt < 3; attempt++) {
         if (!mqtt.connected()) {
-          mqtt.connect(DEVICE_ID);
+          if (!connectMqttForSync(mqttClientId, sizeof(mqttClientId))) {
+            delay(100);
+            continue;
+          }
         }
 
-        if (mqtt.connected() && mqtt.publish(TOPIC_EVENTS, line.c_str())) {
+        int packetBytes = estimatePacketSize(line, TOPIC_EVENTS);
+        if (packetBytes > (int)mqtt.getBufferSize()) {
+          Serial.print("Publish too large. Packet bytes: ");
+          Serial.print(packetBytes);
+          Serial.print(" / MQTT buffer: ");
+          Serial.println(mqtt.getBufferSize());
+        } else if (mqtt.publish(TOPIC_EVENTS, line.c_str())) {
           published = true;
           break;
+        } else {
+          Serial.print("Publish failed. payload=");
+          Serial.print(line.length());
+          Serial.print(" packet=");
+          Serial.print(packetBytes);
+          Serial.print(" buffer=");
+          Serial.print(mqtt.getBufferSize());
+          Serial.print(" state=");
+          Serial.println(mqtt.state());
         }
 
         mqtt.loop();
@@ -353,6 +399,7 @@ void syncLogs() {
       snprintf(status, sizeof(status), "SYNCING %d/%d", sent, totalLines);
       drawSyncScreen(status);
       mqtt.loop();
+      delay(20);
     }
     f.close();
 
@@ -917,6 +964,10 @@ void syncRtcFromNtp() {
 
 void setup() {
   Serial.begin(115200);
+
+  if (!mqtt.setBufferSize(MQTT_BUFFER_SIZE)) {
+    Serial.println("Failed to set MQTT buffer size");
+  }
 
   Wire.begin(PIN_RTC_SDA, PIN_RTC_SCL);
   rtc.Begin();
