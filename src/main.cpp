@@ -42,6 +42,7 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 96
 #define DISPLAY_FPS 30
+#define MQTT_BUFFER_SIZE 512
 
 // ==========================================
 //               GLOBALS
@@ -331,6 +332,13 @@ void syncLogs() {
         if (mqtt.connected() && mqtt.publish(TOPIC_EVENTS, line.c_str())) {
           published = true;
           break;
+        }
+
+        if (mqtt.connected()) {
+          Serial.print("Publish failed. Payload bytes: ");
+          Serial.print(line.length());
+          Serial.print(" / MQTT buffer: ");
+          Serial.println(mqtt.getBufferSize());
         }
 
         mqtt.loop();
@@ -917,6 +925,10 @@ void syncRtcFromNtp() {
 
 void setup() {
   Serial.begin(115200);
+
+  if (!mqtt.setBufferSize(MQTT_BUFFER_SIZE)) {
+    Serial.println("Failed to set MQTT buffer size");
+  }
 
   Wire.begin(PIN_RTC_SDA, PIN_RTC_SCL);
   rtc.Begin();
