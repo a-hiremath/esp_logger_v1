@@ -1,0 +1,4 @@
+.pio
+src/secrets.h
+.idea/
+.claude/
